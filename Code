@@ -1,0 +1,472 @@
+// npk_sensori
+// Projectiot@123
+
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
+#include <WiFi.h>
+#include <LiquidCrystal.h>
+#include <DHT.h>
+
+// ===== TinyML Includes =====
+#include "TensorFlowLite_ESP32.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
+
+#include "agri_mlp_model.h5"      // generated from agri_mlp_model.tflite
+#include "scaler_params.h"   // generated from Python script
+
+// ================= IOT CLOUD =================
+const char DEVICE_LOGIN_NAME[]  = "0631618f-4f64-40e3-b04f-12da2b462fa5";
+const char SSID[]               = "projectiotnpk";
+const char PASS[]               = "projectiotnpk";
+const char DEVICE_KEY[]         = "5!V7gsbZTamocluTuVhsbpiun";
+
+void onNpkstatusChange();
+void onStatusChange();
+void onTempiChange();
+void onHumidChange();
+void onMoistureChange();
+
+String npkstatus;   // NPK + crop + fertilizer
+String status;      // Overall AI status + reason
+float tempi;
+int humid;
+int moisture;
+
+void initProperties() {
+  ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
+  ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
+
+  ArduinoCloud.addProperty(npkstatus, READWRITE, ON_CHANGE, onNpkstatusChange);
+  ArduinoCloud.addProperty(status, READWRITE, ON_CHANGE, onStatusChange);
+  ArduinoCloud.addProperty(tempi, READWRITE, ON_CHANGE, onTempiChange);
+  ArduinoCloud.addProperty(humid, READWRITE, ON_CHANGE, onHumidChange);
+  ArduinoCloud.addProperty(moisture, READWRITE, ON_CHANGE, onMoistureChange);
+}
+
+WiFiConnectionHandler ArduinoIoTPreferredConnection(SSID, PASS);
+
+// ================= LCD =================
+LiquidCrystal lcd(2, 15, 19, 18, 5, 4);
+
+// ================= DHT11 =================
+#define DHTPIN 23
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= SOIL SENSOR =================
+#define SOIL_SENSOR 35
+
+// ================= SERIAL2 FOR NPK RX =================
+#define RXD2 16
+#define TXD2 17
+
+float N_value = 0.0;
+float P_value = 0.0;
+float K_value = 0.0;
+
+// ================= THRESHOLDS =================
+#define SOIL_MIN 1500
+#define SOIL_MAX 4095
+
+unsigned long lastLCDUpdate = 0;
+unsigned long lastSerialPrint = 0;
+
+// =====================================================
+// TinyML Globals
+// =====================================================
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+const tflite::Model* model = nullptr;
+tflite::AllOpsResolver resolver;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+TfLiteTensor* output = nullptr;
+
+constexpr int tensor_arena_size = 12 * 1024;
+uint8_t tensor_arena[tensor_arena_size];
+
+// =====================================================
+// NPK SERIAL RX
+// Expected format example: N45.0P38.0K60.0
+// =====================================================
+void readNPKSerial() {
+  while (Serial2.available()) {
+    String line = Serial2.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() > 0) {
+      int nIndex = line.indexOf('N');
+      int pIndex = line.indexOf('P');
+      int kIndex = line.indexOf('K');
+
+      if (nIndex >= 0 && pIndex > nIndex && kIndex > pIndex) {
+        String nStr = line.substring(nIndex + 1, pIndex);
+        String pStr = line.substring(pIndex + 1, kIndex);
+        String kStr = line.substring(kIndex + 1);
+
+        N_value = nStr.toFloat();
+        P_value = pStr.toFloat();
+        K_value = kStr.toFloat();
+
+        Serial.print("Received NPK -> ");
+        Serial.print("N: "); Serial.print(N_value, 1);
+        Serial.print(" P: "); Serial.print(P_value, 1);
+        Serial.print(" K: "); Serial.println(K_value, 1);
+      }
+    }
+  }
+}
+
+// =====================================================
+// MOISTURE PERCENT
+// =====================================================
+int moisturePercent(int raw) {
+  if (raw <= SOIL_MIN) return 100;
+  if (raw >= SOIL_MAX) return 0;
+  return map(raw, SOIL_MIN, SOIL_MAX, 100, 0);
+}
+
+// =====================================================
+// LCD STATUS HELPERS
+// =====================================================
+String getTempStatus(float t) {
+  if (t < 25) return "L";
+  else if (t <= 35) return "N";
+  else return "H";
+}
+
+String getHumStatus(float h) {
+  if (h < 40) return "L";
+  else if (h <= 70) return "N";
+  else return "H";
+}
+
+String getMoistStatus(int m) {
+  if (m >= 50) return "W";
+  else return "D";
+}
+
+// =====================================================
+// NPK CROP + FERTILIZER RECOMMENDATION
+// Keep text logic for IoT app
+// =====================================================
+String getCropFertilizerRecommendation(float t, float h, int m, float n, float p, float k) {
+  String crop = "General";
+  String fert = "Balanced NPK";
+
+  if (m < 30) {
+    if (n < 40 && p < 40 && k < 40) {
+      crop = "Millet";
+      fert = "NPK19:19:19";
+    } else if (n < 40) {
+      crop = "Maize";
+      fert = "Urea+Compost";
+    } else if (p < 40) {
+      crop = "Groundnut";
+      fert = "DAP/SSP";
+    } else if (k < 40) {
+      crop = "Tomato";
+      fert = "MOP+Organic";
+    } else {
+      crop = "Cotton";
+      fert = "Micronutrient Mix";
+    }
+  }
+  else if (m >= 30 && m < 60) {
+    if (t >= 25 && t <= 34 && h >= 45 && h <= 75) {
+      if (n >= 40 && p >= 40 && k >= 40) {
+        crop = "Paddy";
+        fert = "Maintain NPK";
+      } else if (n < 40) {
+        crop = "LeafyVeg";
+        fert = "Urea+Vermicompost";
+      } else if (p < 40) {
+        crop = "Carrot";
+        fert = "DAP/SSP";
+      } else if (k < 40) {
+        crop = "Chilli";
+        fert = "Potash+Compost";
+      } else {
+        crop = "Brinjal";
+        fert = "Balanced Fertilizer";
+      }
+    } else if (h > 75) {
+      if (k < 40) {
+        crop = "Banana";
+        fert = "Potash";
+      } else {
+        crop = "Paddy";
+        fert = "Urea+DAP";
+      }
+    } else if (t > 35 && h < 45) {
+      crop = "Sorghum";
+      fert = "Organic+Mulch";
+    } else {
+      crop = "Vegetables";
+      fert = "Balanced NPK";
+    }
+  }
+  else {
+    if (h > 75) {
+      if (n >= 45 && p >= 35 && k >= 45) {
+        crop = "Paddy";
+        fert = "Low Extra Fert";
+      } else {
+        crop = "Paddy";
+        fert = "Urea+DAP+Potash";
+      }
+    } else if (k < 40) {
+      crop = "Tomato";
+      fert = "Potash";
+    } else {
+      crop = "Cucumber";
+      fert = "Compost+Balanced NPK";
+    }
+  }
+
+  return "N:" + String(n, 1) +
+         " P:" + String(p, 1) +
+         " K:" + String(k, 1) +
+         " | Crop:" + crop +
+         " | Fert:" + fert;
+}
+
+// =====================================================
+// NORMALIZATION FOR TINYML INPUT
+// =====================================================
+float normalizeInput(float x, float xmin, float xmax) {
+  if ((xmax - xmin) == 0) return 0.0;
+  float val = (x - xmin) / (xmax - xmin);
+  if (val < 0) val = 0;
+  if (val > 1) val = 1;
+  return val;
+}
+
+// =====================================================
+// REASON STRING
+// =====================================================
+String getReasonFromInputs(float t, float h, int m, float n, float p, float k) {
+  String reason = "";
+
+  if (t < 20 || t > 38) reason += "Temp out, ";
+  else if ((t >= 20 && t < 25) || (t > 35 && t <= 38)) reason += "Temp moderate, ";
+
+  if (h < 30 || h > 85) reason += "Humidity critical, ";
+  else if ((h >= 30 && h < 40) || (h > 70 && h <= 85)) reason += "Humidity moderate, ";
+
+  if (m < 20) reason += "Soil dry, ";
+  else if (m < 40) reason += "Soil slight dry, ";
+  else if (m > 85) reason += "Soil too wet, ";
+
+  if (n < 35) reason += "N low, ";
+  if (p < 35) reason += "P low, ";
+  if (k < 35) reason += "K low, ";
+
+  if (reason.length() == 0) {
+    return "All parameters normal";
+  }
+
+  if (reason.endsWith(", ")) {
+    reason.remove(reason.length() - 2);
+  }
+  return reason;
+}
+
+// =====================================================
+// TinyML Prediction
+// class 0 = Good
+// class 1 = Moderate
+// class 2 = Poor
+// =====================================================
+String predictTinyMLStatus(float t, float h, int m, float n, float p, float k) {
+  input->data.f[0] = normalizeInput(t, X_MIN[0], X_MAX[0]);
+  input->data.f[1] = normalizeInput(h, X_MIN[1], X_MAX[1]);
+  input->data.f[2] = normalizeInput((float)m, X_MIN[2], X_MAX[2]);
+  input->data.f[3] = normalizeInput(n, X_MIN[3], X_MAX[3]);
+  input->data.f[4] = normalizeInput(p, X_MIN[4], X_MAX[4]);
+  input->data.f[5] = normalizeInput(k, X_MIN[5], X_MAX[5]);
+
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  if (invoke_status != kTfLiteOk) {
+    return "AI:ModelErr | Reason:Inference failed";
+  }
+
+  float goodProb = output->data.f[0];
+  float modProb  = output->data.f[1];
+  float poorProb = output->data.f[2];
+
+  int predClass = 0;
+  float maxProb = goodProb;
+
+  if (modProb > maxProb) {
+    maxProb = modProb;
+    predClass = 1;
+  }
+  if (poorProb > maxProb) {
+    maxProb = poorProb;
+    predClass = 2;
+  }
+
+  String aiState = "Good";
+  if (predClass == 1) aiState = "Moderate";
+  else if (predClass == 2) aiState = "Poor";
+
+  String reason = getReasonFromInputs(t, h, m, n, p, k);
+
+  return "AI:" + aiState + " | Reason:" + reason;
+}
+
+// =====================================================
+// TINYML INIT
+// =====================================================
+void setupTinyML() {
+  model = tflite::GetModel(g_model);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("Model schema mismatch!");
+    return;
+  }
+
+  static tflite::MicroInterpreter static_interpreter(
+    model, resolver, tensor_arena, tensor_arena_size, error_reporter
+  );
+
+  interpreter = &static_interpreter;
+
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    Serial.println("AllocateTensors failed");
+    return;
+  }
+
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  Serial.println("TinyML model loaded successfully");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(9600);
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+  lcd.begin(16, 2);
+  lcd.clear();
+
+  dht.begin();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Agri");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  delay(2000);
+  lcd.clear();
+
+  setupTinyML();
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  ArduinoCloud.update();
+
+  // Keep same NPK serial RX logic
+  readNPKSerial();
+
+  // Sensor read
+  float temperature = dht.readTemperature();
+  float humidityVal = dht.readHumidity();
+  int soilRaw = analogRead(SOIL_SENSOR);
+
+  if (isnan(temperature)) temperature = 0;
+  if (isnan(humidityVal)) humidityVal = 0;
+
+  int moistureVal = moisturePercent(soilRaw);
+
+  String tempS = getTempStatus(temperature);
+  String humS  = getHumStatus(humidityVal);
+  String moistS = getMoistStatus(moistureVal);
+
+  // Individual IoT vars
+  tempi = temperature;
+  humid = (int)humidityVal;
+  moisture = moistureVal;
+
+  // IoT app strings
+  npkstatus = getCropFertilizerRecommendation(
+    temperature, humidityVal, moistureVal,
+    N_value, P_value, K_value
+  );
+
+  // TinyML-based AI status
+  status = predictTinyMLStatus(
+    temperature, humidityVal, moistureVal,
+    N_value, P_value, K_value
+  );
+
+  // Serial print
+  if (millis() - lastSerialPrint >= 2000) {
+    lastSerialPrint = millis();
+
+    Serial.print("Temp: "); Serial.print(temperature, 1);
+    Serial.print(" | Hum: "); Serial.print(humidityVal, 1);
+    Serial.print(" | Moist: "); Serial.print(moistureVal);
+    Serial.print(" | N: "); Serial.print(N_value, 1);
+    Serial.print(" P: "); Serial.print(P_value, 1);
+    Serial.print(" K: "); Serial.print(K_value, 1);
+    Serial.print(" | ");
+    Serial.print(npkstatus);
+    Serial.print(" | ");
+    Serial.println(status);
+  }
+
+  // ================= LCD SAME STYLE =================
+  if (millis() - lastLCDUpdate >= 1000) {
+    lastLCDUpdate = millis();
+
+    // First line
+    lcd.setCursor(0, 0);
+    lcd.print("                ");
+    lcd.setCursor(0, 0);
+    lcd.print("T");
+    lcd.print((int)temperature);
+    lcd.print(tempS);
+    lcd.print(" H");
+    lcd.print((int)humidityVal);
+    lcd.print(humS);
+    lcd.print(" M");
+    lcd.print(moistureVal);
+    lcd.print(moistS);
+
+    // Second line
+    lcd.setCursor(0, 1);
+    lcd.print("                ");
+    lcd.setCursor(0, 1);
+    lcd.print("N");
+    lcd.print((int)N_value);
+    lcd.print(" P");
+    lcd.print((int)P_value);
+    lcd.print(" K");
+    lcd.print((int)K_value);
+  }
+}
+
+// =====================================================
+// CALLBACKS
+// =====================================================
+void onNpkstatusChange() {}
+void onStatusChange() {}
+void onTempiChange() {}
+void onHumidChange() {}
+void onMoistureChange() {}
